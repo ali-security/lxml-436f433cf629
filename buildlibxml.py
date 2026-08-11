@@ -139,6 +139,15 @@ LIBXML2_LOCATION = 'https://download.gnome.org/sources/libxml2/'
 LIBXSLT_LOCATION = 'https://download.gnome.org/sources/libxslt/'
 LIBICONV_LOCATION = 'https://ftp.gnu.org/pub/gnu/libiconv/'
 ZLIB_LOCATION = 'https://zlib.net/'
+# zlib.net only serves the current release; superseded releases move to fossils/.
+ZLIB_FOSSILS_LOCATION = ZLIB_LOCATION + 'fossils/'
+# Versions that were embedded in the published wheels of this release.
+LIBICONV_VERSION = '1.17'
+ZLIB_VERSION = '1.3'
+# zlib 1.3 does not compile against current macOS SDKs: its pre-1.3.1 "fdopen"
+# handling collides with the SDK's _stdio.h, which breaks zutil.o. Use the next
+# upstream patch release on macOS (byte parity is not reachable there anyway).
+ZLIB_VERSION_DARWIN = '1.3.1'
 match_libfile_version = re.compile('^[^-]*-([.0-9-]+)[.].*').match
 
 
@@ -298,6 +307,8 @@ def download_libiconv(dest_dir, version=None):
     """Downloads libiconv, returning the filename where the library was downloaded"""
     version_re = re.compile(r'libiconv-([0-9.]+[0-9]).tar.gz')
     filename = 'libiconv-%s.tar.gz'
+    if version is None:
+        version = LIBICONV_VERSION
     return download_library(dest_dir, LIBICONV_LOCATION, 'libiconv',
                             version_re, filename, version=version)
 
@@ -306,8 +317,23 @@ def download_zlib(dest_dir, version):
     """Downloads zlib, returning the filename where the library was downloaded"""
     version_re = re.compile(r'zlib-([0-9.]+[0-9]).tar.gz')
     filename = 'zlib-%s.tar.gz'
-    return download_library(dest_dir, ZLIB_LOCATION, 'zlib',
-                            version_re, filename, version=version)
+    if version is None:
+        version = ZLIB_VERSION_DARWIN if sys_platform == 'darwin' else ZLIB_VERSION
+    # Superseded zlib releases are only available from the "fossils/" directory.
+    locations = [ZLIB_LOCATION, ZLIB_FOSSILS_LOCATION]
+    if version:
+        # zlib.net sometimes serves a non-archive body (rate limiting / error page
+        # with a success status) when many parallel CI jobs fetch it at once.  The
+        # GitHub release assets are version addressed and not rate limited, so use
+        # them as a last resort mirror.  Note that download_library() joins the
+        # location with the file name, so this must end in '/'.
+        locations.append(
+            'https://github.com/madler/zlib/releases/download/v%s/' % version)
+    # Try every location twice so that a one-off truncated download self-heals.
+    locations = [location for location in locations for _ in range(2)]
+    return download_library(dest_dir, locations[0], 'zlib',
+                            version_re, filename, version=version,
+                            fallback_locations=locations[1:])
 
 
 def find_max_version(libname, filenames, version_re=None):
@@ -330,7 +356,46 @@ def find_max_version(libname, filenames, version_re=None):
     return version_string
 
 
-def download_library(dest_dir, location, name, version_re, filename, version=None):
+def remove_file(filename):
+    """Delete a (possibly partially downloaded) file, ignoring missing files."""
+    try:
+        os.unlink(filename)
+    except OSError:
+        pass
+
+
+# Leading magic bytes of the archive formats that we download.
+_ARCHIVE_MAGIC_BYTES = [
+    ('.tar.gz', b'\x1f\x8b'),
+    ('.tgz', b'\x1f\x8b'),
+    ('.tar.bz2', b'BZh'),
+    ('.tar.xz', b'\xfd7zXZ\x00'),
+    ('.zip', b'PK'),
+]
+
+
+def is_valid_archive(filename):
+    """Check that a downloaded file really is the archive that was requested.
+
+    A server can answer a request for a missing file with an HTML error page and
+    a success status, and Python 2's urlretrieve() stores the body of an HTTP
+    error response instead of raising, so a "successful" download can silently
+    produce a non-archive file that only fails later in unpack_tarball().
+    """
+    for extension, magic in _ARCHIVE_MAGIC_BYTES:
+        if filename.endswith(extension):
+            break
+    else:
+        return True  # unknown file type => nothing we can validate here
+    try:
+        with open(filename, 'rb') as f:
+            return f.read(len(magic)) == magic
+    except IOError:
+        return False
+
+
+def download_library(dest_dir, location, name, version_re, filename, version=None,
+                     fallback_locations=()):
     if version is None:
         try:
             if location.startswith('ftp://'):
@@ -356,17 +421,43 @@ def download_library(dest_dir, location, name, version_re, filename, version=Non
                 raise
     if version:
         filename = filename % version
-    full_url = urljoin(location, filename)
     dest_filename = os.path.join(dest_dir, filename)
     if os.path.exists(dest_filename):
-        print(('Using existing %s downloaded into %s '
-               '(delete this file if you want to re-download the package)') % (
+        if is_valid_archive(dest_filename):
+            print(('Using existing %s downloaded into %s '
+                   '(delete this file if you want to re-download the package)') % (
+                name, dest_filename))
+            return dest_filename
+        print('Existing %s in %s is not a valid archive, re-downloading' % (
             name, dest_filename))
-    else:
+
+    last_error = None
+    for try_location in [location] + list(fallback_locations):
+        full_url = urljoin(try_location, filename)
+        # A failed download can leave the HTTP error body (or a truncated file)
+        # behind, which would then be reused above as a corrupt tarball.
+        remove_file(dest_filename)
         print('Downloading %s into %s from %s' % (name, dest_filename, full_url))
-        urlcleanup()  # work around FTP bug 27973 in Py2.7.12
-        urlretrieve(full_url, dest_filename)
-    return dest_filename
+        try:
+            urlcleanup()  # work around FTP bug 27973 in Py2.7.12
+            urlretrieve(full_url, dest_filename)
+        except IOError as exc:  # includes HTTPError / URLError
+            print('Download of %s from %s failed: %s' % (name, full_url, exc))
+            last_error = exc
+            continue
+        if not is_valid_archive(dest_filename):
+            # Most likely an HTML error page served with a success status (or,
+            # on Py2, an HTTP error body that urlretrieve() did not raise for).
+            # Treat it as a failed attempt so the fallback locations are tried
+            # instead of handing a corrupt file to unpack_tarball().
+            message = 'Download of %s from %s is not a valid archive' % (name, full_url)
+            print(message)
+            last_error = IOError(message)
+            continue
+        return dest_filename
+
+    remove_file(dest_filename)
+    raise last_error
 
 
 def unpack_tarball(tar_filename, dest):

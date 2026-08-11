@@ -1,14 +1,14 @@
 name: Wheel build
 
 on:
-  release:
-    types: [created]
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   sdist:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     permissions:
       contents: write
@@ -19,13 +19,17 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.x"
+        python-version: "3.12"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      # The 2.9.13* pin is unsatisfiable now that ubuntu-latest is noble (it ships
+      # 2.9.14+). These host libs only serve the sdist/doc build; the wheels are all
+      # built with STATIC_DEPS=true against their own downloaded libxml2/libxslt.
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install Python dependencies
-      run: python -m pip install -U pip setuptools && python -m pip install -U docutils pygments sphinx sphinx-rtd-theme -r requirements.txt
+      # setuptools<70 keeps pkg_resources.parse_requirements(), which setup.py calls.
+      run: python -m pip install -U pip "setuptools<70" && python -m pip install -U docutils pygments sphinx sphinx-rtd-theme -r requirements.txt
 
     - name: Build docs and sdist
       run: make html sdist
@@ -38,19 +42,15 @@ jobs:
         files: dist/*.tar.gz
 
     - name: Upload sdist
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: sdist
         path: dist/*.tar.gz
 
-    - name: Upload website
-      uses: actions/upload-artifact@v3
-      with:
-        name: website
-        path: doc/html
-
   Linux:
-    runs-on: ubuntu-latest
+    # aarch64 images run on native arm runners instead of QEMU emulation.
+    runs-on: ${{ contains(matrix.image, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 360
 
     permissions:
       contents: write
@@ -92,8 +92,9 @@ jobs:
             pyversion: "cp311*"
           - image: manylinux_2_28_aarch64
             pyversion: "cp311*"
-          - image: manylinux_2_24_aarch64
-            pyversion: "cp312*"
+          # No cp312 leg for manylinux_2_24_aarch64: that image is archived at
+          # 2022-12 and ships no /opt/python/cp312*, and upstream published no
+          # cp312 manylinux_2_24 wheel either (cp312 ships as 2_28 + musllinux).
           - image: manylinux_2_28_aarch64
             pyversion: "cp312*"
 
@@ -121,10 +122,14 @@ jobs:
         python-version: "3.11"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      # The 2.9.13* pin is unsatisfiable now that ubuntu-latest is noble (it ships
+      # 2.9.14+). These host libs only serve the sdist/doc build; the wheels are all
+      # built with STATIC_DEPS=true against their own downloaded libxml2/libxslt.
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install dependencies
-      run: python -m pip install -r requirements.txt
+      # setuptools<70 keeps pkg_resources.parse_requirements(), which setup.py calls.
+      run: python -m pip install --force-reinstall --upgrade "setuptools<70" && python -m pip install -r requirements.txt
 
     - name: Build sdist
       run: make sdist
@@ -141,9 +146,10 @@ jobs:
         files: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.image }}
+        # v4 requires unique artifact names per matrix leg, and forbids '*' in them.
+        name: wheels-${{ matrix.image }}-${{ strategy.job-index }}
         path: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
         if-no-files-found: ignore
 
@@ -153,7 +159,7 @@ jobs:
       fail-fast: false
 
       matrix:
-        os: [macos-latest, windows-2019]
+        os: [macos-latest, windows-latest]
         #os: [macos-10.15, windows-latest]
         #os: [macos-10.15]
         python-version:
@@ -173,10 +179,20 @@ jobs:
         #  - os: windows-2016
         #    python-version: 2.7
         exclude:
-          - os: windows-2019
+          - os: windows-latest
             python-version: 2.7  # needs older image
+          # Upstream published no macOS cp27 wheel for this release (the released
+          # cp27 wheels are manylinux_2_5 i686/x86_64 and win32/win_amd64 only),
+          # so this leg cannot produce an artifact we need.  macOS 26 ships no
+          # Python 2.7 and setup-python only provisions 3.*/pypy, so the leg just
+          # fails in the static build.  Every other leg still runs the full suite.
+          - os: macos-latest
+            python-version: "2.7"
 
-    runs-on: ${{ matrix.os }}
+    # Python 3.6 and 3.7 cannot be provisioned on arm64 macOS (no arm64 builds
+    # exist for them), so those legs run on the intel macOS image.
+    runs-on: ${{ (matrix.os == 'macos-latest' && contains(fromJSON('["3.6","3.7"]'), matrix.python-version)) && 'macos-15-intel' || matrix.os }}
+    timeout-minutes: 360
 
     permissions:
       contents: write
@@ -199,7 +215,14 @@ jobs:
         ln -s /usr/local/bin/glibtoolize /usr/local/bin/libtoolize
 
     - name: Install dependencies
-      run: python -m pip install setuptools wheel -r requirements.txt
+      # --force-reinstall --upgrade: the setup-python action pre-seeds a newer
+      # setuptools/wheel, which would otherwise satisfy this install and leave
+      # the pinned versions unused.
+      # setuptools<70 is required: setup.py calls pkg_resources.parse_requirements(),
+      # which newer setuptools no longer exposes ("module 'pkg_resources' has no
+      # attribute 'parse_requirements'"). --force-reinstall defeats the newer
+      # setuptools/wheel that setup-python pre-seeds into the toolcache.
+      run: python -m pip install --force-reinstall --upgrade "setuptools<70" wheel -r requirements.txt
 
     - name: Build wheels
       run: make wheel
@@ -212,8 +235,9 @@ jobs:
         files: dist/lxml-*.whl
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.os }}
+        # v4 requires unique artifact names per matrix leg.
+        name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
         path: dist/lxml-*.whl
         if-no-files-found: ignore

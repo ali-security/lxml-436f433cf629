@@ -18,6 +18,18 @@ MANYLINUX_LIBXSLT_VERSION=1.1.39
 MANYLINUX_CFLAGS=-O3 -g1 -pipe -fPIC -flto
 MANYLINUX_LDFLAGS=-flto
 
+# The ":latest" tags of the quay.io/pypa images have drifted since this release
+# (gcc-toolset-14 makes -Wincompatible-pointer-types fatal, cp313 appeared which
+# Cython 0.29 cannot build, cp36-cp38 were dropped), so pin those images to a tag
+# from the release period.  The archived manylinux_2_24_* and the manylinux1 /
+# manylinux2010 images are frozen upstream and keep ":latest".
+PYPA_IMAGE_TAG=:2023-12-18-e7e3b8c
+IMAGE_TAG_manylinux_2_28_x86_64=$(PYPA_IMAGE_TAG)
+IMAGE_TAG_manylinux_2_28_aarch64=$(PYPA_IMAGE_TAG)
+IMAGE_TAG_musllinux_1_1_x86_64=$(PYPA_IMAGE_TAG)
+IMAGE_TAG_musllinux_1_1_aarch64=$(PYPA_IMAGE_TAG)
+IMAGE_TAG_manylinux2014_aarch64=$(PYPA_IMAGE_TAG)
+
 MANYLINUX_IMAGES= \
 	manylinux1_x86_64 \
 	manylinux1_i686 \
@@ -65,7 +77,7 @@ qemu-user-static:
 	docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
 wheel_manylinux: $(addprefix wheel_,$(MANYLINUX_IMAGES))
-$(addprefix wheel_,$(filter-out %_x86_64, $(filter-out %_i686, $(MANYLINUX_IMAGES)))): qemu-user-static
+# aarch64 wheels are built on native arm runners, so no QEMU registration is needed.
 
 wheel_%: dist/lxml-$(LXMLVERSION).tar.gz
 	time docker run --rm -t \
@@ -79,8 +91,9 @@ wheel_%: dist/lxml-$(LXMLVERSION).tar.gz
 		-e LIBXML2_VERSION="$(MANYLINUX_LIBXML2_VERSION)" \
 		-e LIBXSLT_VERSION="$(MANYLINUX_LIBXSLT_VERSION)" \
 		-e PYTHON_BUILD_VERSION="$(PYTHON_BUILD_VERSION)" \
+		-e PIP_INDEX_URL="$(PIP_INDEX_URL)" \
 		-e WHEELHOUSE=$(subst wheel_,wheelhouse/,$@) \
-		quay.io/pypa/$(subst wheel_,,$@) \
+		quay.io/pypa/$(subst wheel_,,$@)$(or $(IMAGE_TAG_$(subst wheel_,,$@)),:latest) \
 		bash /io/tools/manylinux/build-wheels.sh /io/$<
 
 wheel:
